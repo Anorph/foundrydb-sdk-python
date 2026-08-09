@@ -243,6 +243,7 @@ class FileServicesAPI:
         prefix: str = "",
         cursor: str = "",
         max: int = 0,
+        delimiter: str = "",
     ) -> FilesObjectPage:
         """Return one page of the bucket's objects.
 
@@ -260,6 +261,8 @@ class FileServicesAPI:
             params["cursor"] = cursor
         if max > 0:
             params["max"] = max
+        if delimiter:
+            params["delimiter"] = delimiter
         data = self._http.get(
             f"/file-services/{service_id}/objects",
             params=params or None,
@@ -391,6 +394,7 @@ class AsyncFileServicesAPI:
         prefix: str = "",
         cursor: str = "",
         max: int = 0,
+        delimiter: str = "",
     ) -> FilesObjectPage:
         """Return one page of the bucket's objects."""
         params: Dict[str, Any] = {}
@@ -400,6 +404,8 @@ class AsyncFileServicesAPI:
             params["cursor"] = cursor
         if max > 0:
             params["max"] = max
+        if delimiter:
+            params["delimiter"] = delimiter
         data = await self._http.get(
             f"/file-services/{service_id}/objects",
             params=params or None,

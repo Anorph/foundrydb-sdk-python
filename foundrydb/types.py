@@ -2691,6 +2691,9 @@ class FilesObjectPage:
 
     objects: List[FilesObject]
     next_cursor: str = ""
+    # Common prefixes ("folders") under the current prefix, present when the
+    # request used a delimiter. Each ends with the delimiter.
+    prefixes: List[str] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -2698,6 +2701,7 @@ class FilesObjectPage:
         return cls(
             objects=[FilesObject.from_dict(o) for o in d.get("objects", [])],
             next_cursor=d.get("next_cursor", ""),
+            prefixes=list(d.get("prefixes", [])),
             raw=d,
         )
 
