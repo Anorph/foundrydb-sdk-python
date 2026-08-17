@@ -286,6 +286,86 @@ print(settings.config_version)   # version the fleet will converge on
 
 `EdgeDomainStatus` values: `pending_verification`, `verifying`, `issuing_certificate`, `propagating`, `active`, `failed`, `deleting`.
 
+### Managed Inference Services
+
+An inference service is an open-weight LLM served by vLLM behind an
+OpenAI-compatible endpoint on the service's own hostname. There are two SKUs:
+`serverless` multiplexes onto a platform-owned shared GPU pool (no plan, curated
+models only, billed per token), and `dedicated` rents a whole-card GPU server
+(GPU plan, curated or Hugging Face models, LoRA adapters, keep-warm, billed per
+GPU-hour).
+
+```python
+from foundrydb import FoundryDB, InferenceConfig
+
+client = FoundryDB(api_url="https://api.foundrydb.com", username="admin", password="admin")
+
+# Serverless: pick a model a shared pool is already serving.
+models = client.inference_services.list_serverless_models()
+svc = client.inference_services.create_serverless(
+    name="cheap-llm",
+    model_id=models[0].model_id,
+    license_accepted=True,
+)
+
+# Dedicated: check the model fits the plan before provisioning anything.
+fit = client.inference_services.check_fit(
+    model_source="curated",
+    model_id="llama-3.3-70b",
+    plan_name="gpu-l4-1",
+    max_model_len=32768,
+)
+if not fit.fits:
+    print(fit.limiting_factor, fit.recommended_plan)
+
+svc = client.inference_services.create(
+    name="my-llm",
+    inference_config=InferenceConfig(
+        model_id="mistral-small",
+        model_source="curated",
+        max_model_len=32768,
+        license_accepted=True,
+    ),
+    plan_name="gpu-l40s-1",
+    zone="fi-hel2",
+)
+
+# Poll until the endpoint is minted, then call it with an fdb-inf key using
+# the model foundrydb_managed/<served_model_name>.
+svc = client.inference_services.get(svc.id)   # None when it does not exist
+print(svc.status, svc.endpoint_base_url)
+
+usage = client.inference_services.get_usage(svc.id, since="24h")
+metrics = client.inference_services.get_metrics(svc.id, since="30m")
+
+client.inference_services.switch_model(svc.id, model_id="qwen3-32b")
+client.inference_services.delete(svc.id)
+```
+
+| Method | Description |
+|--------|-------------|
+| `list()` | Inference services visible to the caller |
+| `get(service_id)` | One service, or `None` when it does not exist |
+| `create(...)` | Provision a dedicated or serverless service |
+| `create_serverless(...)` | Convenience create on the shared pool |
+| `delete(service_id)` | Tear the service down (404 treated as success) |
+| `list_model_rates()` | Published per-token and per-image prices |
+| `list_serverless_models()` | Models a serverless create can bind to now |
+| `check_fit(...)` | VRAM fit preflight; provisions nothing |
+| `switch_model(service_id, ...)` | Swap the served curated model in place |
+| `get_usage(service_id, ...)` | Metered usage, cost, month-to-date rollup |
+| `get_metrics(service_id, ...)` | Live vLLM and GPU telemetry |
+| `list_adapters(service_id)` | LoRA adapter versions for the service |
+| `promote_adapter(...)` / `demote_adapter(...)` | Hot-load or unload an adapter |
+| `register_adapter(...)` / `delete_adapter(...)` | Serving-registry lifecycle |
+
+The inference proxy management plane stays on `client.inference`: provider
+configs, data-plane keys (`create_key(..., service_id=...)` scopes a key to one
+inference service, and the result carries an `activation_note`), the ordered
+provider chain with its per-surface overrides (`get_provider_chain`,
+`set_provider_chain`, `set_surface_override`, `delete_surface_override`), and
+aggregated usage whose `free_tier` reports the monthly free token allowance.
+
 ## Async Client
 
 All methods have async equivalents. Use `AsyncFoundryDB` as an async context manager:

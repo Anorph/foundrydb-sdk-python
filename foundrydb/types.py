@@ -2760,6 +2760,7 @@ class InferenceKey:
     tokens_used_cycle: int
     cycle_month: str
     created_at: str
+    service_id: Optional[str] = None
     revoked_at: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -2775,6 +2776,7 @@ class InferenceKey:
             tokens_used_cycle=d.get("tokens_used_cycle", 0),
             cycle_month=d.get("cycle_month", ""),
             created_at=d.get("created_at", ""),
+            service_id=d.get("service_id"),
             revoked_at=d.get("revoked_at"),
             raw=d,
         )
@@ -2783,10 +2785,19 @@ class InferenceKey:
 @dataclass
 class CreateInferenceKeyResult:
     """Response from creating an inference key. The secret is shown exactly
-    once; store it immediately."""
+    once; store it immediately.
+
+    ``activation_note`` states when the secret starts working at the
+    inference endpoint. The key hash reaches the data plane through an edge
+    config reconcile that the mint requests immediately, so a request sent in
+    the same breath as the mint can still answer ``invalid_key`` and should be
+    retried shortly. It is advisory text rather than a status field, because
+    the control plane cannot confirm per-node application at mint time.
+    """
 
     key: InferenceKey
     secret: str
+    activation_note: str = ""
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -2795,6 +2806,7 @@ class CreateInferenceKeyResult:
         return cls(
             key=InferenceKey.from_dict(key_raw),
             secret=d.get("secret", ""),
+            activation_note=d.get("activation_note", ""),
             raw=d,
         )
 
@@ -2854,22 +2866,795 @@ class InferenceUsageRow:
 
 
 @dataclass
+class OrgInferenceFreeTierStatus:
+    """An organization's monthly free token allowance for platform-served
+    (``foundrydb_managed``) inference, as it stands now.
+
+    Tokens inside the allowance are metered exactly like paid tokens but
+    recorded at zero cost, so the allowance is consumed before any billing
+    starts. Only platform-served token calls draw on it: a call to the
+    organization's own third-party provider is billed on that provider's
+    account, and an image generation is priced per image and reports no
+    tokens, so neither consumes the allowance.
+    """
+
+    cycle_month: str
+    monthly_tokens: int
+    tokens_used: int
+    tokens_remaining: int
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "OrgInferenceFreeTierStatus":
+        return cls(
+            cycle_month=d.get("cycle_month", ""),
+            monthly_tokens=d.get("monthly_tokens", 0),
+            tokens_used=d.get("tokens_used", 0),
+            tokens_remaining=d.get("tokens_remaining", 0),
+            raw=d,
+        )
+
+
+@dataclass
 class InferenceUsageSummary:
-    """Aggregated inference usage for an organization."""
+    """Aggregated inference usage for an organization.
+
+    ``free_tier`` always describes the current calendar month regardless of
+    the queried window, because the allowance is a monthly meter and not an
+    aggregate of the window. It is ``None`` when the standing could not be
+    read; the rows still answer.
+    """
 
     from_: str
     to: str
     group_by: str
     rows: List[InferenceUsageRow]
+    free_tier: Optional[OrgInferenceFreeTierStatus] = None
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "InferenceUsageSummary":
+        free_tier_raw = d.get("free_tier")
         return cls(
             from_=d.get("from", ""),
             to=d.get("to", ""),
             group_by=d.get("group_by", ""),
             rows=[InferenceUsageRow.from_dict(r) for r in d.get("rows", [])],
+            free_tier=(
+                OrgInferenceFreeTierStatus.from_dict(free_tier_raw)
+                if free_tier_raw
+                else None
+            ),
+            raw=d,
+        )
+
+
+# The platform AI surfaces whose provider chain may be overridden.
+InferenceSurface = Literal["chat", "advisor", "embedding", "agent", "explainer"]
+
+
+@dataclass
+class InferenceChainOverride:
+    """One platform AI surface's provider chain override. While it exists,
+    that surface resolves through ``provider_chain`` instead of the org-level
+    chain."""
+
+    surface: str
+    provider_chain: List[str]
+    organization_id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceChainOverride":
+        return cls(
+            surface=d.get("surface", ""),
+            provider_chain=list(d.get("provider_chain") or []),
+            organization_id=d.get("organization_id", ""),
+            created_at=d.get("created_at", ""),
+            updated_at=d.get("updated_at", ""),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceProviderChainInfo:
+    """An organization's provider chain configuration: the ordered chain,
+    whether every provider in it routes EU-resident, and the per-surface
+    overrides currently in place. An empty chain is not EU-resident, because
+    there is nothing to attest."""
+
+    provider_chain: List[str]
+    fully_eu_resident: bool
+    overrides: List[InferenceChainOverride]
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceProviderChainInfo":
+        return cls(
+            provider_chain=list(d.get("provider_chain") or []),
+            fully_eu_resident=d.get("fully_eu_resident", False),
+            overrides=[
+                InferenceChainOverride.from_dict(o) for o in d.get("overrides", [])
+            ],
+            raw=d,
+        )
+
+
+# ---- Inference service models ----
+
+# How an inference service is placed. "dedicated" rents a whole-card GPU
+# server for the tenant and bills per GPU-hour; it requires a GPU plan.
+# "serverless" binds the service to a platform-owned shared pool and bills
+# per token; it takes no plan.
+InferenceSKU = Literal["dedicated", "serverless"]
+
+# How a model's weights are obtained. "curated" is a blessed catalog model
+# the platform has license-verified; "huggingface" is an on-demand pull by
+# Hugging Face repo id, whose license is the customer's responsibility.
+InferenceModelSource = Literal["curated", "huggingface"]
+
+# What a published model rate charges per. "tokens" carries the two token
+# figures; "image" carries image_microcents_per_unit and reads zero tokens.
+InferenceModelRateUnit = Literal["tokens", "image"]
+
+# The surface a serverless model answers on.
+ServerlessModelCapability = Literal["chat", "embeddings", "rerank", "image"]
+
+# The term of the fit equation that broke the plan's memory budget.
+# "weights" means the weights alone exceed the budget, so no context length
+# makes the configuration fit; "kv_cache" means the weights fit but the
+# requested context does not; "fits" is reported when the configuration fits.
+InferenceFitLimitingFactor = Literal["weights", "kv_cache", "fits"]
+
+# The shape of a proposed fix for a configuration that does not fit.
+InferenceFitSuggestionKind = Literal["reduce_context", "fp8_kv_cache", "larger_plan"]
+
+# Lifecycle status of a LoRA fine-tuned adapter in the serving registry.
+InferenceAdapterStatus = Literal["uploaded", "active", "superseded", "archived"]
+
+
+@dataclass
+class InferenceConfig:
+    """Model selection and vLLM serving knobs for an inference service.
+
+    For a curated model the platform resolves the repository, served name,
+    and context length from the catalog. For a Hugging Face model,
+    ``model_id`` is the ``org/name`` repo id and ``served_model_name`` is
+    required.
+
+    ``hf_token`` is write-only: it is accepted on create and never returned
+    by any response. ``kv_cache_dtype`` is read-only: it is catalog-owned and
+    never accepted from a create request.
+    """
+
+    model_id: str
+    model_source: str = "curated"
+    served_model_name: str = ""
+    hf_repo: str = ""
+    hf_token: str = ""
+    dtype: str = ""
+    max_model_len: int = 0
+    gpu_memory_utilization: float = 0.0
+    tensor_parallel_size: int = 0
+    quantization: str = ""
+    kv_cache_dtype: str = ""
+    license_accepted: bool = False
+    enable_fine_tuned_serving: bool = False
+    max_loras: int = 0
+    max_lora_rank: int = 0
+    keep_warm_minutes: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for a request body, omitting the fields left unset so
+        the platform applies its own defaults."""
+        body: Dict[str, Any] = {
+            "model_id": self.model_id,
+            "model_source": self.model_source,
+        }
+        if self.served_model_name:
+            body["served_model_name"] = self.served_model_name
+        if self.hf_repo:
+            body["hf_repo"] = self.hf_repo
+        if self.hf_token:
+            body["hf_token"] = self.hf_token
+        if self.dtype:
+            body["dtype"] = self.dtype
+        if self.max_model_len:
+            body["max_model_len"] = self.max_model_len
+        if self.gpu_memory_utilization:
+            body["gpu_memory_utilization"] = self.gpu_memory_utilization
+        if self.tensor_parallel_size:
+            body["tensor_parallel_size"] = self.tensor_parallel_size
+        if self.quantization:
+            body["quantization"] = self.quantization
+        if self.license_accepted:
+            body["license_accepted"] = True
+        if self.enable_fine_tuned_serving:
+            body["enable_fine_tuned_serving"] = True
+        if self.max_loras:
+            body["max_loras"] = self.max_loras
+        if self.max_lora_rank:
+            body["max_lora_rank"] = self.max_lora_rank
+        if self.keep_warm_minutes:
+            body["keep_warm_minutes"] = self.keep_warm_minutes
+        return body
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceConfig":
+        return cls(
+            model_id=d.get("model_id", ""),
+            model_source=d.get("model_source", ""),
+            served_model_name=d.get("served_model_name", ""),
+            hf_repo=d.get("hf_repo", ""),
+            hf_token=d.get("hf_token", ""),
+            dtype=d.get("dtype", ""),
+            max_model_len=d.get("max_model_len", 0),
+            gpu_memory_utilization=d.get("gpu_memory_utilization", 0.0),
+            tensor_parallel_size=d.get("tensor_parallel_size", 0),
+            quantization=d.get("quantization", ""),
+            kv_cache_dtype=d.get("kv_cache_dtype", ""),
+            license_accepted=d.get("license_accepted", False),
+            enable_fine_tuned_serving=d.get("enable_fine_tuned_serving", False),
+            max_loras=d.get("max_loras", 0),
+            max_lora_rank=d.get("max_lora_rank", 0),
+            keep_warm_minutes=d.get("keep_warm_minutes", 0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceService:
+    """A managed inference service: an open-weight LLM served by vLLM, on a
+    whole-card GPU server (``inference_sku`` ``dedicated``) or on a
+    platform-owned shared pool (``serverless``).
+
+    ``endpoint_base_url`` is the complete OpenAI-compatible base URL to point
+    an SDK at, so no client has to assemble a scheme, a host and a ``/v1``
+    suffix of its own. It is always a platform address and never the upstream
+    the platform forwards to. Call it with an ``fdb-inf`` key and the model
+    ``foundrydb_managed/<served_model_name>``.
+
+    ``provisioning_message`` is the newest live provisioning heartbeat while
+    a deploy is in flight, so it is worth surfacing only while polling a
+    create. It is returned by the single-service read only.
+    """
+
+    id: str
+    user_id: str
+    name: str
+    service_kind: str
+    status: str
+    zone: str
+    plan_name: str
+    node_count: int
+    tls_enabled: bool
+    created_at: str
+    updated_at: str
+    organization_id: str = ""
+    inference_sku: str = ""
+    storage_size_gb: Optional[int] = None
+    storage_tier: str = ""
+    inference_config: Optional[InferenceConfig] = None
+    error_message: str = ""
+    endpoint_hostname: str = ""
+    endpoint_base_url: str = ""
+    provisioning_message: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceService":
+        config_raw = d.get("inference_config")
+        return cls(
+            id=d.get("id", ""),
+            user_id=d.get("user_id", ""),
+            name=d.get("name", ""),
+            service_kind=d.get("service_kind", ""),
+            status=d.get("status", ""),
+            zone=d.get("zone", ""),
+            plan_name=d.get("plan_name", ""),
+            node_count=d.get("node_count", 0),
+            tls_enabled=d.get("tls_enabled", False),
+            created_at=d.get("created_at", ""),
+            updated_at=d.get("updated_at", ""),
+            organization_id=d.get("organization_id") or "",
+            inference_sku=d.get("inference_sku", ""),
+            storage_size_gb=d.get("storage_size_gb"),
+            storage_tier=d.get("storage_tier", ""),
+            inference_config=(
+                InferenceConfig.from_dict(config_raw) if config_raw else None
+            ),
+            error_message=d.get("error_message") or "",
+            endpoint_hostname=d.get("endpoint_hostname") or "",
+            endpoint_base_url=d.get("endpoint_base_url") or "",
+            provisioning_message=d.get("provisioning_message") or "",
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceModelRate:
+    """One curated model's published price as it stands right now, the rate a
+    serverless call on that model is metered at.
+
+    ``prompt_microcents_per_1k`` and ``completion_microcents_per_1k`` are in
+    microcents per one thousand tokens; divide by 100,000 for the currency
+    amount per one million tokens. Both are zero on an image-priced rate,
+    where ``image_microcents_per_unit`` prices one generated image; divide
+    that by 100,000,000 for the currency amount per image.
+    """
+
+    model_id: str
+    prompt_microcents_per_1k: int
+    completion_microcents_per_1k: int
+    effective_from: str
+    rate_unit: str = "tokens"
+    image_microcents_per_unit: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceModelRate":
+        return cls(
+            model_id=d.get("model_id", ""),
+            prompt_microcents_per_1k=d.get("prompt_microcents_per_1k", 0),
+            completion_microcents_per_1k=d.get("completion_microcents_per_1k", 0),
+            effective_from=d.get("effective_from", ""),
+            rate_unit=d.get("rate_unit") or "tokens",
+            image_microcents_per_unit=d.get("image_microcents_per_unit", 0),
+            raw=d,
+        )
+
+
+@dataclass
+class ServerlessInferenceModel:
+    """One curated model a shared pool can answer for right now, and so one a
+    serverless create can bind to. It describes the model, never the pool.
+
+    ``serving`` is always true on a listed model: a model with no serving
+    pool is omitted rather than listed as unavailable. ``deprecated`` marks a
+    model whose weights are end of life upstream; it is still listed and
+    still bindable, so treat it as retiring rather than as a default choice.
+    """
+
+    model_id: str
+    display_name: str
+    capability: str
+    serving: bool
+    deprecated: bool
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ServerlessInferenceModel":
+        return cls(
+            model_id=d.get("model_id", ""),
+            display_name=d.get("display_name", ""),
+            capability=d.get("capability", ""),
+            serving=d.get("serving", False),
+            deprecated=d.get("deprecated", False),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceFitSuggestion:
+    """One concrete way to make a refused configuration fit. Suggestions are
+    only offered when they would actually work, so a weights-limited refusal
+    never proposes trimming the context."""
+
+    kind: str
+    detail: str
+    plan_name: str = ""
+    max_model_len: int = 0
+    tensor_parallel_size: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceFitSuggestion":
+        return cls(
+            kind=d.get("kind", ""),
+            detail=d.get("detail", ""),
+            plan_name=d.get("plan_name", ""),
+            max_model_len=d.get("max_model_len", 0),
+            tensor_parallel_size=d.get("tensor_parallel_size", 0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceFitCheckResult:
+    """The verdict of the VRAM fit preflight, the memory breakdown it was
+    reached from, and the closest fixes when it is a refusal. All sizes are
+    gibibytes of VRAM.
+
+    ``max_context_that_fits`` is zero when the weights alone exceed the
+    budget, in which case no context length helps. ``recommended_plan`` is
+    the smallest GPU plan on which the request fits, answered whether or not
+    the plan that was asked about fits.
+    """
+
+    fits: bool
+    weights_gb: float
+    kv_cache_gb: float
+    overhead_gb: float
+    budget_gb: float
+    plan_vram_gb: int
+    max_context_that_fits: int
+    limiting_factor: str
+    suggestions: List[InferenceFitSuggestion] = field(default_factory=list)
+    recommended_plan: str = ""
+    recommended_tensor_parallel_size: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceFitCheckResult":
+        return cls(
+            fits=d.get("fits", False),
+            weights_gb=d.get("weights_gb", 0.0),
+            kv_cache_gb=d.get("kv_cache_gb", 0.0),
+            overhead_gb=d.get("overhead_gb", 0.0),
+            budget_gb=d.get("budget_gb", 0.0),
+            plan_vram_gb=d.get("plan_vram_gb", 0),
+            max_context_that_fits=d.get("max_context_that_fits", 0),
+            limiting_factor=d.get("limiting_factor", ""),
+            suggestions=[
+                InferenceFitSuggestion.from_dict(s) for s in d.get("suggestions", [])
+            ],
+            recommended_plan=d.get("recommended_plan", ""),
+            recommended_tensor_parallel_size=d.get(
+                "recommended_tensor_parallel_size", 0
+            ),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceUsageTotals:
+    """Usage counters rolled up across every bucket in the requested window.
+
+    ``images`` stays zero for a text model, which produces none; an image
+    model meters images rather than output tokens, so it is the only usage
+    figure that moves there. ``p95_latency_ms`` is computed over the metered
+    calls rather than folded up from the series, because a percentile is not
+    summable.
+    """
+
+    calls: int
+    errors: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_microcents: int
+    images: int = 0
+    avg_latency_ms: int = 0
+    p95_latency_ms: int = 0
+    error_rate: float = 0.0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceUsageTotals":
+        return cls(
+            calls=d.get("calls", 0),
+            errors=d.get("errors", 0),
+            input_tokens=d.get("input_tokens", 0),
+            output_tokens=d.get("output_tokens", 0),
+            total_tokens=d.get("total_tokens", 0),
+            cost_microcents=d.get("cost_microcents", 0),
+            images=d.get("images", 0),
+            avg_latency_ms=d.get("avg_latency_ms", 0),
+            p95_latency_ms=d.get("p95_latency_ms", 0),
+            error_rate=d.get("error_rate", 0.0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceUsagePoint:
+    """One time bucket of usage. Empty buckets are omitted from the series."""
+
+    bucket_start: str
+    calls: int
+    errors: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_microcents: int
+    images: int = 0
+    avg_latency_ms: int = 0
+    p95_latency_ms: int = 0
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceUsagePoint":
+        return cls(
+            bucket_start=d.get("bucket_start", ""),
+            calls=d.get("calls", 0),
+            errors=d.get("errors", 0),
+            input_tokens=d.get("input_tokens", 0),
+            output_tokens=d.get("output_tokens", 0),
+            total_tokens=d.get("total_tokens", 0),
+            cost_microcents=d.get("cost_microcents", 0),
+            images=d.get("images", 0),
+            avg_latency_ms=d.get("avg_latency_ms", 0),
+            p95_latency_ms=d.get("p95_latency_ms", 0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceGpuHourCost:
+    """The accrued GPU-hour spend for a dedicated inference service over the
+    window, in EUR.
+
+    ``billed_hours`` is the number of hourly billing snapshots counted,
+    ``hourly_rate_eur`` the most recent hourly rate, and ``cost_eur`` the
+    summed spend, approximately ``hourly_rate_eur * billed_hours``.
+    """
+
+    billed_hours: int
+    hourly_rate_eur: float
+    cost_eur: float
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceGpuHourCost":
+        return cls(
+            billed_hours=d.get("billed_hours", 0),
+            hourly_rate_eur=d.get("hourly_rate_eur", 0.0),
+            cost_eur=d.get("cost_eur", 0.0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceUsageMonthToDate:
+    """One service's calendar-month-to-date rollup, independent of the window
+    the caller asked for.
+
+    Both charges sit on it so a client does not issue a second request per
+    range change: ``tokens`` is the per-token charge a serverless service
+    accrues, ``gpu_hour`` the per-GPU-hour charge a dedicated one accrues.
+    ``from_`` is the first instant of the current UTC month, or the service's
+    creation time when it is younger than the month, so a two-day-old service
+    never claims a full month.
+    """
+
+    from_: str
+    tokens: InferenceServiceUsageTotals
+    gpu_hour: Optional[InferenceServiceGpuHourCost] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceUsageMonthToDate":
+        gpu_hour_raw = d.get("gpu_hour")
+        return cls(
+            from_=d.get("from", ""),
+            tokens=InferenceServiceUsageTotals.from_dict(d.get("tokens") or {}),
+            gpu_hour=(
+                InferenceServiceGpuHourCost.from_dict(gpu_hour_raw)
+                if gpu_hour_raw
+                else None
+            ),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceUsage:
+    """A service's metered usage over a window: rolled-up totals plus the
+    ordered bucket series.
+
+    Usage is attributed to the service's dedicated endpoint within the owning
+    organization, so two services serving the same model never share each
+    other's usage, and the window never starts before the service was
+    created. Which figure is the charge depends on the SKU:
+    ``month_to_date.tokens`` for a serverless service and
+    ``month_to_date.gpu_hour`` for a dedicated one. The other is a usage
+    signal, not a bill.
+    """
+
+    service_id: str
+    from_: str
+    to: str
+    bucket_seconds: int
+    totals: InferenceServiceUsageTotals
+    series: List[InferenceServiceUsagePoint] = field(default_factory=list)
+    gpu_hour: Optional[InferenceServiceGpuHourCost] = None
+    month_to_date: Optional[InferenceServiceUsageMonthToDate] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceUsage":
+        gpu_hour_raw = d.get("gpu_hour")
+        mtd_raw = d.get("month_to_date")
+        return cls(
+            service_id=d.get("service_id", ""),
+            from_=d.get("from", ""),
+            to=d.get("to", ""),
+            bucket_seconds=d.get("bucket_seconds", 0),
+            totals=InferenceServiceUsageTotals.from_dict(d.get("totals") or {}),
+            series=[
+                InferenceServiceUsagePoint.from_dict(p) for p in d.get("series", [])
+            ],
+            gpu_hour=(
+                InferenceServiceGpuHourCost.from_dict(gpu_hour_raw)
+                if gpu_hour_raw
+                else None
+            ),
+            month_to_date=(
+                InferenceServiceUsageMonthToDate.from_dict(mtd_raw)
+                if mtd_raw
+                else None
+            ),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceGPUStats:
+    """A single GPU's hardware telemetry sampled from nvidia-smi on the
+    inference node. Memory is in mebibytes and power in watts."""
+
+    index: int
+    util_percent: float
+    mem_used_mb: float
+    mem_total_mb: float
+    temp_c: float
+    power_w: float
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceGPUStats":
+        return cls(
+            index=d.get("index", 0),
+            util_percent=d.get("util_percent", 0.0),
+            mem_used_mb=d.get("mem_used_mb", 0.0),
+            mem_total_mb=d.get("mem_total_mb", 0.0),
+            temp_c=d.get("temp_c", 0.0),
+            power_w=d.get("power_w", 0.0),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServerMetricsSnapshot:
+    """One sampled reading of a GPU inference node's live serving telemetry:
+    the vLLM server's own Prometheus metrics plus the node's GPU hardware
+    counters.
+
+    Token throughput and the average-latency fields are interval rates
+    derived on the node from the delta between two consecutive scrapes, so
+    the first scrape after start reports zero for those. ``server_reachable``
+    is false when the vLLM metrics endpoint could not be scraped this tick
+    (still starting, crash-looping, or draining), in which case the GPU
+    fields may still be present.
+    """
+
+    collected_at: str
+    server_reachable: bool = False
+    model_name: str = ""
+    requests_running: float = 0.0
+    requests_waiting: float = 0.0
+    gpu_cache_usage_perc: float = 0.0
+    generation_tokens_per_sec: float = 0.0
+    prompt_tokens_per_sec: float = 0.0
+    avg_ttft_ms: float = 0.0
+    avg_tpot_ms: float = 0.0
+    avg_e2e_latency_ms: float = 0.0
+    requests_success_total: float = 0.0
+    gpus: List[InferenceGPUStats] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServerMetricsSnapshot":
+        return cls(
+            collected_at=d.get("collected_at", ""),
+            server_reachable=d.get("server_reachable", False),
+            model_name=d.get("model_name", ""),
+            requests_running=d.get("requests_running", 0.0),
+            requests_waiting=d.get("requests_waiting", 0.0),
+            gpu_cache_usage_perc=d.get("gpu_cache_usage_perc", 0.0),
+            generation_tokens_per_sec=d.get("generation_tokens_per_sec", 0.0),
+            prompt_tokens_per_sec=d.get("prompt_tokens_per_sec", 0.0),
+            avg_ttft_ms=d.get("avg_ttft_ms", 0.0),
+            avg_tpot_ms=d.get("avg_tpot_ms", 0.0),
+            avg_e2e_latency_ms=d.get("avg_e2e_latency_ms", 0.0),
+            requests_success_total=d.get("requests_success_total", 0.0),
+            gpus=[InferenceGPUStats.from_dict(g) for g in d.get("gpus") or []],
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceServiceMetrics:
+    """The live-metrics payload for one inference service: the ordered
+    snapshot series over the requested window plus the most recent snapshot
+    for the realtime tiles.
+
+    It is the live vLLM and GPU telemetry the inference node samples,
+    distinct from the metered usage and cost.
+    """
+
+    service_id: str
+    from_: str
+    to: str
+    snapshots: List[InferenceServerMetricsSnapshot] = field(default_factory=list)
+    latest: Optional[InferenceServerMetricsSnapshot] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceServiceMetrics":
+        latest_raw = d.get("latest")
+        return cls(
+            service_id=d.get("service_id", ""),
+            from_=d.get("from", ""),
+            to=d.get("to", ""),
+            snapshots=[
+                InferenceServerMetricsSnapshot.from_dict(s)
+                for s in d.get("snapshots") or []
+            ],
+            latest=(
+                InferenceServerMetricsSnapshot.from_dict(latest_raw)
+                if latest_raw
+                else None
+            ),
+            raw=d,
+        )
+
+
+@dataclass
+class InferenceModelAdapter:
+    """One version of a customer LoRA fine-tuned adapter in the serving
+    registry.
+
+    The adapter is trained on the organization's data and its weights stored
+    in Files (object storage); promoting it downloads the weights onto the
+    base-model GPU, verifies their hash, and hot-loads them into vLLM. Once
+    active, the service answers to the adapter as
+    ``foundrydb_managed/<served_model_name>`` on the OpenAI-compatible
+    endpoint. An adapter never leaves its owning organization's boundary.
+
+    ``inference_service_id`` is ``None`` while the row is only uploaded and
+    not yet promoted; ``version`` is monotonic per organization and served
+    model name, and a rollback re-promotes a prior version.
+    """
+
+    id: str
+    organization_id: str
+    base_model_id: str
+    served_model_name: str
+    version: int
+    files_bucket: str
+    files_key_prefix: str
+    adapter_sha256: str
+    size_bytes: int
+    status: str
+    created_at: str
+    inference_service_id: Optional[str] = None
+    base_model_license: str = ""
+    promoted_at: Optional[str] = None
+    deleted_at: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "InferenceModelAdapter":
+        return cls(
+            id=d.get("id", ""),
+            organization_id=d.get("organization_id", ""),
+            base_model_id=d.get("base_model_id", ""),
+            served_model_name=d.get("served_model_name", ""),
+            version=d.get("version", 0),
+            files_bucket=d.get("files_bucket", ""),
+            files_key_prefix=d.get("files_key_prefix", ""),
+            adapter_sha256=d.get("adapter_sha256", ""),
+            size_bytes=d.get("size_bytes", 0),
+            status=d.get("status", ""),
+            created_at=d.get("created_at", ""),
+            inference_service_id=d.get("inference_service_id"),
+            base_model_license=d.get("base_model_license", ""),
+            promoted_at=d.get("promoted_at"),
+            deleted_at=d.get("deleted_at"),
             raw=d,
         )
 

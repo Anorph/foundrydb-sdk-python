@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .queues import QueuesAPI, AsyncQueuesAPI
     from .file_services import FileServicesAPI, AsyncFileServicesAPI
     from .inference import InferenceAPI, AsyncInferenceAPI
+    from .inference_services import InferenceServicesAPI, AsyncInferenceServicesAPI
     from .webhooks import WebhooksAPI, AsyncWebhooksAPI
     from .data_pipelines import DataPipelinesAPI, AsyncDataPipelinesAPI
     from .embedding_pipelines import EmbeddingPipelinesAPI, AsyncEmbeddingPipelinesAPI
@@ -252,6 +253,7 @@ class FoundryDB:
         from .queues import QueuesAPI
         from .file_services import FileServicesAPI
         from .inference import InferenceAPI
+        from .inference_services import InferenceServicesAPI
         from .webhooks import WebhooksAPI
         from .data_pipelines import DataPipelinesAPI
         from .embedding_pipelines import EmbeddingPipelinesAPI
@@ -273,6 +275,7 @@ class FoundryDB:
         self.queues: QueuesAPI = QueuesAPI(http)
         self.file_services: FileServicesAPI = FileServicesAPI(http)
         self.inference: InferenceAPI = InferenceAPI(http)
+        self.inference_services: InferenceServicesAPI = InferenceServicesAPI(http)
         self.webhooks: WebhooksAPI = WebhooksAPI(http)
         self.data_pipelines: DataPipelinesAPI = DataPipelinesAPI(http)
         self.embedding_pipelines: EmbeddingPipelinesAPI = EmbeddingPipelinesAPI(http)
@@ -341,6 +344,7 @@ class AsyncFoundryDB:
         from .queues import AsyncQueuesAPI
         from .file_services import AsyncFileServicesAPI
         from .inference import AsyncInferenceAPI
+        from .inference_services import AsyncInferenceServicesAPI
         from .webhooks import AsyncWebhooksAPI
         from .data_pipelines import AsyncDataPipelinesAPI
         from .embedding_pipelines import AsyncEmbeddingPipelinesAPI
@@ -362,6 +366,7 @@ class AsyncFoundryDB:
         self.queues: AsyncQueuesAPI = AsyncQueuesAPI(http)
         self.file_services: AsyncFileServicesAPI = AsyncFileServicesAPI(http)
         self.inference: AsyncInferenceAPI = AsyncInferenceAPI(http)
+        self.inference_services: AsyncInferenceServicesAPI = AsyncInferenceServicesAPI(http)
         self.webhooks: AsyncWebhooksAPI = AsyncWebhooksAPI(http)
         self.data_pipelines: AsyncDataPipelinesAPI = AsyncDataPipelinesAPI(http)
         self.embedding_pipelines: AsyncEmbeddingPipelinesAPI = AsyncEmbeddingPipelinesAPI(http)

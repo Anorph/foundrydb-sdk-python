@@ -2,9 +2,11 @@
 FoundryDB SDK - Inference Proxy API (sync and async).
 
 Organizations bring their own provider API keys, mint dedicated data-plane
-keys for their applications, set org-wide policy (EU-only routing, monthly
-cost circuit breaker), and read aggregated usage. The data plane itself is
-OpenAI-compatible at /inference/v1/* authenticated with fdb-inf keys.
+keys for their applications, set the ordered provider chain each platform AI
+surface resolves through, set org-wide policy (EU-only routing, monthly cost
+circuit breaker), and read aggregated usage together with the monthly free
+token allowance. The data plane itself is OpenAI-compatible at
+/inference/v1/* authenticated with fdb-inf keys.
 """
 from __future__ import annotations
 
@@ -13,7 +15,9 @@ from typing import Any, Dict, List, Optional
 from .client import HTTPClient, AsyncHTTPClient
 from .types import (
     InferenceProviderConfig,
+    InferenceChainOverride,
     InferenceKey,
+    InferenceProviderChainInfo,
     CreateInferenceKeyResult,
     OrgInferenceSettings,
     InferenceUsageSummary,
@@ -96,17 +100,24 @@ class InferenceAPI:
         name: str,
         monthly_token_limit: int,
         rate_limit_rpm: Optional[int] = None,
+        service_id: Optional[str] = None,
     ) -> CreateInferenceKeyResult:
         """Mint a new data-plane key.
 
         The returned secret is shown exactly once; store it immediately.
-        ``monthly_token_limit`` is required and must be positive.
+        ``monthly_token_limit`` is required and must be positive. The key does
+        not take effect at the inference endpoint the instant it is minted:
+        read ``activation_note`` on the result before calling with it.
 
         Args:
             org_id: Organization ID.
             name: Human-readable label for the key.
             monthly_token_limit: Per-month token ceiling (required, > 0).
             rate_limit_rpm: Requests-per-minute cap. Defaults to unlimited.
+            service_id: Scope the key to one inference service the
+                organization owns, so the credential reaches that endpoint and
+                no other. Omitted mints an org-scoped key, usable against any
+                of the organization's inference services.
         """
         body: Dict[str, Any] = {
             "name": name,
@@ -114,6 +125,8 @@ class InferenceAPI:
         }
         if rate_limit_rpm is not None:
             body["rate_limit_rpm"] = rate_limit_rpm
+        if service_id is not None:
+            body["service_id"] = service_id
         data = self._http.post(f"{self._base(org_id)}/keys", body)
         return CreateInferenceKeyResult.from_dict(data)
 
@@ -169,6 +182,69 @@ class InferenceAPI:
         return OrgInferenceSettings.from_dict(data)
 
     # ------------------------------------------------------------------
+    # Provider chain
+    # ------------------------------------------------------------------
+
+    def get_provider_chain(self, org_id: str) -> InferenceProviderChainInfo:
+        """Return the organization's provider chain, its EU-residency
+        verdict, and the per-surface overrides.
+
+        Platform AI surfaces resolve their upstream through this chain unless
+        a surface override replaces it.
+        """
+        data = self._http.get(f"{self._base(org_id)}/chain")
+        return InferenceProviderChainInfo.from_dict(data)
+
+    def set_provider_chain(
+        self,
+        org_id: str,
+        provider_chain: List[str],
+    ) -> InferenceProviderChainInfo:
+        """Replace the organization's ordered provider chain wholesale.
+
+        Each entry is a provider identifier (``openai``, ``anthropic``,
+        ``mistral``, ``azure_openai``, ``groq``, ``foundrydb_managed``); the
+        literal terminator ``"none"`` may close the chain to state that
+        resolution stops there with no implicit platform fallback. Entries
+        must be unique and the terminator must be the final entry.
+        Per-surface overrides are untouched and echoed back in the returned
+        configuration.
+        """
+        body: Dict[str, Any] = {"provider_chain": provider_chain}
+        data = self._http.put(f"{self._base(org_id)}/chain", body)
+        return InferenceProviderChainInfo.from_dict(data)
+
+    def set_surface_override(
+        self,
+        org_id: str,
+        surface: str,
+        provider_chain: List[str],
+    ) -> InferenceChainOverride:
+        """Replace the provider chain for one platform AI surface.
+
+        While the override exists, that surface resolves through it instead of
+        the org-level chain.
+
+        Args:
+            org_id: Organization ID.
+            surface: ``chat``, ``advisor``, ``embedding``, ``agent``, or
+                ``explainer``.
+            provider_chain: The ordered chain for this surface, following the
+                same rules as the org-level chain.
+        """
+        body: Dict[str, Any] = {"provider_chain": provider_chain}
+        data = self._http.put(
+            f"{self._base(org_id)}/chain/overrides/{surface}", body
+        )
+        return InferenceChainOverride.from_dict(data)
+
+    def delete_surface_override(self, org_id: str, surface: str) -> None:
+        """Remove one surface's provider chain override so the org-level chain
+        applies to it again. Deleting an absent override succeeds, so the call
+        is idempotent."""
+        self._http.delete(f"{self._base(org_id)}/chain/overrides/{surface}")
+
+    # ------------------------------------------------------------------
     # Usage
     # ------------------------------------------------------------------
 
@@ -181,6 +257,12 @@ class InferenceAPI:
         group_by: str = "",
     ) -> InferenceUsageSummary:
         """Return aggregated inference usage for the organization.
+
+        The result also carries ``free_tier``, the organization's monthly free
+        token allowance standing. It always describes the current calendar
+        month regardless of the queried window, because the allowance is a
+        monthly meter and not an aggregate of the window; it is ``None`` when
+        the standing could not be read, and the rows still answer.
 
         Args:
             org_id: Organization ID.
@@ -257,14 +339,22 @@ class AsyncInferenceAPI:
         name: str,
         monthly_token_limit: int,
         rate_limit_rpm: Optional[int] = None,
+        service_id: Optional[str] = None,
     ) -> CreateInferenceKeyResult:
-        """Mint a new data-plane key. The secret is shown exactly once."""
+        """Mint a new data-plane key. The secret is shown exactly once.
+
+        ``service_id`` scopes the key to one inference service the
+        organization owns; omitted mints an org-scoped key. Read
+        ``activation_note`` on the result before calling with the secret.
+        """
         body: Dict[str, Any] = {
             "name": name,
             "monthly_token_limit": monthly_token_limit,
         }
         if rate_limit_rpm is not None:
             body["rate_limit_rpm"] = rate_limit_rpm
+        if service_id is not None:
+            body["service_id"] = service_id
         data = await self._http.post(f"{self._base(org_id)}/keys", body)
         return CreateInferenceKeyResult.from_dict(data)
 
@@ -302,6 +392,45 @@ class AsyncInferenceAPI:
         data = await self._http.put(f"{self._base(org_id)}/settings", body)
         return OrgInferenceSettings.from_dict(data)
 
+    async def get_provider_chain(self, org_id: str) -> InferenceProviderChainInfo:
+        """Return the organization's provider chain, its EU-residency verdict,
+        and the per-surface overrides."""
+        data = await self._http.get(f"{self._base(org_id)}/chain")
+        return InferenceProviderChainInfo.from_dict(data)
+
+    async def set_provider_chain(
+        self,
+        org_id: str,
+        provider_chain: List[str],
+    ) -> InferenceProviderChainInfo:
+        """Replace the organization's ordered provider chain wholesale.
+
+        The literal terminator ``"none"`` may close the chain to state that
+        resolution stops there with no implicit platform fallback. Per-surface
+        overrides are untouched and echoed back.
+        """
+        body: Dict[str, Any] = {"provider_chain": provider_chain}
+        data = await self._http.put(f"{self._base(org_id)}/chain", body)
+        return InferenceProviderChainInfo.from_dict(data)
+
+    async def set_surface_override(
+        self,
+        org_id: str,
+        surface: str,
+        provider_chain: List[str],
+    ) -> InferenceChainOverride:
+        """Replace the provider chain for one platform AI surface (chat,
+        advisor, embedding, agent, explainer)."""
+        body: Dict[str, Any] = {"provider_chain": provider_chain}
+        data = await self._http.put(
+            f"{self._base(org_id)}/chain/overrides/{surface}", body
+        )
+        return InferenceChainOverride.from_dict(data)
+
+    async def delete_surface_override(self, org_id: str, surface: str) -> None:
+        """Remove one surface's provider chain override. Idempotent."""
+        await self._http.delete(f"{self._base(org_id)}/chain/overrides/{surface}")
+
     async def get_usage(
         self,
         org_id: str,
@@ -310,7 +439,11 @@ class AsyncInferenceAPI:
         to: str = "",
         group_by: str = "",
     ) -> InferenceUsageSummary:
-        """Return aggregated inference usage for the organization."""
+        """Return aggregated inference usage for the organization.
+
+        The result also carries ``free_tier``, which always describes the
+        current calendar month regardless of the queried window.
+        """
         params: Dict[str, Any] = {}
         if from_:
             params["from"] = from_
